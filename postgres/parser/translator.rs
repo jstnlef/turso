@@ -1759,11 +1759,22 @@ impl PostgreSQLTranslator {
         }
         let has_explicit_columns = !columns.is_empty();
 
-        // Translate body (VALUES or SELECT)
-        let select_stmt_node = insert
-            .select_stmt
-            .as_ref()
-            .ok_or_else(|| ParseError::ParseError("INSERT missing VALUES or SELECT".into()))?;
+        // Translate ON CONFLICT clause (upsert)
+        let upsert = self.translate_on_conflict(&insert.on_conflict_clause)?;
+
+        let Some(select_stmt_node) = insert.select_stmt.as_ref() else {
+            if upsert.is_some() {
+                return Err(not_supported("ON CONFLICT on INSERT ... DEFAULT VALUES"));
+            }
+            return Ok(ast::Stmt::Insert {
+                with: self.translate_with_clause(&insert.with_clause)?,
+                or_conflict: None,
+                tbl_name,
+                columns,
+                body: ast::InsertBody::DefaultValues,
+                returning: self.translate_returning(&insert.returning_list, relation, true)?,
+            });
+        };
 
         let select_stmt = match &select_stmt_node.node {
             Some(Node::SelectStmt(select)) => select,
@@ -1773,9 +1784,6 @@ impl PostgreSQLTranslator {
                 ));
             }
         };
-
-        // Translate ON CONFLICT clause (upsert)
-        let upsert = self.translate_on_conflict(&insert.on_conflict_clause)?;
 
         let (body, columns) = if !select_stmt.values_lists.is_empty() {
             if !select_stmt.sort_clause.is_empty()
@@ -1788,12 +1796,8 @@ impl PostgreSQLTranslator {
                 ));
             }
             // VALUES clause — compute which columns are DEFAULT in ALL rows.
-            let (rows, default_mask) = self.translate_values(&select_stmt.values_lists)?;
-            if !has_explicit_columns && default_mask.iter().any(|d| *d) {
-                return Err(not_supported(
-                    "DEFAULT in INSERT ... VALUES without a column list",
-                ));
-            }
+            let (rows, default_mask) =
+                self.translate_values(&select_stmt.values_lists, has_explicit_columns)?;
             // Strip columns that use DEFAULT in every row
             let filtered_columns: Vec<ast::Name> = columns
                 .into_iter()
@@ -1856,6 +1860,7 @@ impl PostgreSQLTranslator {
     fn translate_values(
         &self,
         values_lists: &[pg_query::protobuf::Node],
+        strip_defaults: bool,
     ) -> Result<(Vec<Vec<Box<ast::Expr>>>, Vec<bool>), ParseError> {
         use pg_query::protobuf::node::Node;
 
@@ -1891,6 +1896,10 @@ impl PostgreSQLTranslator {
                     }
                 }
             }
+        }
+
+        if !strip_defaults {
+            default_mask.clear();
         }
 
         // Second pass: translate values, filtering out all-default columns.
@@ -11846,7 +11855,18 @@ mod tests {
 
     #[test]
     fn fail_closed_insert_defaults() {
-        assert_not_supported("INSERT INTO t VALUES (DEFAULT, 5)", "without a column list");
+        assert_eq!(
+            translate_to_sql("INSERT INTO t VALUES (DEFAULT, 5)"),
+            "INSERT INTO t VALUES (DEFAULT, 5)"
+        );
+        assert_eq!(
+            translate_to_sql("INSERT INTO t DEFAULT VALUES"),
+            "INSERT INTO t DEFAULT VALUES"
+        );
+        assert_not_supported(
+            "INSERT INTO t DEFAULT VALUES ON CONFLICT DO NOTHING",
+            "ON CONFLICT",
+        );
         assert_not_supported(
             "INSERT INTO t (a) VALUES (DEFAULT) ON CONFLICT DO NOTHING",
             "ON CONFLICT",
