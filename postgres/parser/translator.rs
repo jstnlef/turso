@@ -3,11 +3,14 @@
 // This module translates pg_query's PostgreSQL AST into Turso's SQL AST
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
+use crate::functions::pg_func;
 use crate::sqlstate::{
-    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
-    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
-    SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE,
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_GROUPING_ERROR, SQLSTATE_INVALID_COLUMN_REFERENCE,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_OBJECT_DEFINITION,
+    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_SCHEMA_NAME,
+    SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_COLUMN,
+    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE,
+    SQLSTATE_WINDOWING_ERROR,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -55,6 +58,10 @@ pub struct PostgreSQLTranslator {
     translating_index: std::cell::Cell<bool>,
     /// None when nothing is known about the schema, as in tests.
     relation_name_is_taken: Option<RelationNameCheck>,
+    /// Table name in scope while a generation expression is being translated.
+    generation_expression_table: std::cell::RefCell<Option<String>>,
+    /// Generated columns already present in the table, used for ADD COLUMN validation.
+    existing_generated_columns: Vec<String>,
 }
 
 impl PostgreSQLTranslator {
@@ -69,6 +76,12 @@ impl PostgreSQLTranslator {
         is_taken: impl Fn(&str, &str) -> bool + 'static,
     ) -> Self {
         self.relation_name_is_taken = Some(Box::new(is_taken));
+        self
+    }
+
+    /// Translate an `ALTER TABLE ... ADD COLUMN` of a table with these generated columns.
+    pub fn with_existing_generated_columns(mut self, columns: Vec<String>) -> Self {
+        self.existing_generated_columns = columns;
         self
     }
 
@@ -393,6 +406,13 @@ impl PostgreSQLTranslator {
             }
         }
 
+        validate_generated_columns(
+            &create.table_elts,
+            relation,
+            create.inh_relations.is_empty(),
+            &[],
+        )?;
+
         for elt in &create.table_elts {
             let Some(ref inner) = elt.node else { continue };
             match inner {
@@ -652,6 +672,7 @@ impl PostgreSQLTranslator {
         let mut default_expr: Option<ast::Expr> = None;
         let mut foreign_key: Option<PgForeignKey> = None;
         let mut check_constraints = Vec::new();
+        let mut stored_generated_constraint: Option<ast::NamedColumnConstraint> = None;
 
         for constraint_node in &col_def.constraints {
             let Some(Node::Constraint(constraint)) = &constraint_node.node else {
@@ -701,6 +722,10 @@ impl PostgreSQLTranslator {
                         return Err(not_supported("multiple REFERENCES on one column"));
                     }
                     foreign_key = Some(extract_foreign_key(constraint)?);
+                }
+                ConstrType::ConstrGenerated => {
+                    stored_generated_constraint =
+                        Some(self.translate_generated_constraint(constraint, tbl_name)?);
                 }
                 ConstrType::ConstrNull
                 | ConstrType::ConstrAttrNotDeferrable
@@ -826,6 +851,10 @@ impl PostgreSQLTranslator {
 
         constraints.extend(check_constraints);
 
+        if let Some(gen) = stored_generated_constraint {
+            constraints.push(gen);
+        }
+
         Ok(ast::ColumnDefinition {
             col_name: exact_name(name),
             col_type,
@@ -856,6 +885,30 @@ impl PostgreSQLTranslator {
             .find(|name| !is_taken(&schema, name))
             .expect("the numbers never run out");
         (free_name, false)
+    }
+
+    /// Translate `GENERATED ALWAYS AS (expr) STORED` of a column of table `tbl_name`.
+    fn translate_generated_constraint(
+        &self,
+        constraint: &pg_query::protobuf::Constraint,
+        tbl_name: &ast::QualifiedName,
+    ) -> Result<ast::NamedColumnConstraint, ParseError> {
+        let raw_expr = constraint
+            .raw_expr
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError("GENERATED column missing expression".into()))?;
+        self.generation_expression_table
+            .replace(Some(bare_table_name(tbl_name.name.as_str()).to_string()));
+        let expr = self.translate_expr(raw_expr);
+        self.generation_expression_table.replace(None);
+        Ok(ast::NamedColumnConstraint {
+            name: None,
+            constraint: ast::ColumnConstraint::Generated {
+                generated_always: true,
+                expr: Box::new(expr?),
+                typ: Some(ast::GeneratedColumnType::Stored),
+            },
+        })
     }
 
     /// Convert a PgForeignKey to an AST ForeignKeyClause.
@@ -1063,7 +1116,16 @@ impl PostgreSQLTranslator {
                         ));
                     }
                 };
-                let col = self.translate_column_def(col_def)?;
+                validate_generated_columns(
+                    cmd.def
+                        .as_deref()
+                        .map(std::slice::from_ref)
+                        .unwrap_or_default(),
+                    relation,
+                    false,
+                    &self.existing_generated_columns,
+                )?;
+                let col = self.translate_column_def(col_def, &name)?;
                 ast::AlterTableBody::AddColumn(col)
             }
             AlterTableType::AtDropColumn => ast::AlterTableBody::DropColumn(exact_name(&cmd.name)),
@@ -1088,7 +1150,7 @@ impl PostgreSQLTranslator {
                 if col_def.raw_default.is_some() {
                     return Err(not_supported("ALTER COLUMN TYPE ... USING"));
                 }
-                self.translate_column_def(col_def)?;
+                self.translate_column_def(col_def, &name)?;
                 return Err(not_supported("ALTER TABLE ... ALTER COLUMN ... TYPE"));
             }
             AlterTableType::AtColumnDefault => {
@@ -1208,6 +1270,7 @@ impl PostgreSQLTranslator {
     fn translate_column_def(
         &self,
         col_def: &pg_query::protobuf::ColumnDef,
+        tbl_name: &ast::QualifiedName,
     ) -> Result<ast::ColumnDefinition, ParseError> {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
@@ -1259,6 +1322,10 @@ impl PostgreSQLTranslator {
                         self.translate_expr(raw_expr)?,
                     )))
                 }
+                ConstrType::ConstrGenerated => Some(
+                    self.translate_generated_constraint(constraint, tbl_name)?
+                        .constraint,
+                ),
                 ConstrType::ConstrNull
                 | ConstrType::ConstrAttrNotDeferrable
                 | ConstrType::ConstrAttrImmediate => None,
@@ -1852,9 +1919,9 @@ impl PostgreSQLTranslator {
     }
 
     /// Translate VALUES lists, returning both the translated rows and a bitmask of
-    /// which column positions contain DEFAULT in every row. These positions should
-    /// be stripped from the INSERT column list since SQLite doesn't support DEFAULT
-    /// in VALUES — omitting the column achieves the same effect.
+    /// which column positions contain DEFAULT in every row. When `strip_defaults` is set
+    /// these positions are left out of the rows, and should be stripped from the INSERT
+    /// column list too — omitting the column achieves the same effect.
     // The Box<Expr> is required by ast::OneSelect::Values(Vec<Vec<Box<Expr>>>)
     #[allow(clippy::vec_box, clippy::type_complexity)]
     fn translate_values(
@@ -3151,6 +3218,11 @@ impl PostgreSQLTranslator {
                                     parts.push(s.sval.clone());
                                 }
                                 match parts.len() {
+                                    3 if self.generation_expression_table.borrow().as_deref()
+                                        == Some(parts[1].as_str()) =>
+                                    {
+                                        Ok(ast::Expr::Id(exact_name(parts[2].clone())))
+                                    }
                                     3 => {
                                         // schema.table.column. The table name is not mapped:
                                         // FROM aliases a renamed table with its original name.
@@ -3159,6 +3231,11 @@ impl PostgreSQLTranslator {
                                             exact_name(parts[1].clone()),
                                             exact_name(parts[2].clone()),
                                         ))
+                                    }
+                                    2 if self.generation_expression_table.borrow().as_deref()
+                                        == Some(parts[0].as_str()) =>
+                                    {
+                                        Ok(ast::Expr::Id(exact_name(parts[1].clone())))
                                     }
                                     2 => {
                                         // table.column
@@ -6650,6 +6727,407 @@ fn extract_key_columns(keys: &[pg_query::protobuf::Node]) -> Result<Vec<String>,
         cols.push(s.sval.clone());
     }
     Ok(cols)
+}
+
+/// Check the generated columns among `table_elts`, which declares every column of the table
+/// when `has_all_columns` is set, in a table that already has `existing_generated_columns`.
+fn validate_generated_columns<'a>(
+    table_elts: &'a [pg_query::protobuf::Node],
+    relation: &'a pg_query::protobuf::RangeVar,
+    has_all_columns: bool,
+    existing_generated_columns: &'a [String],
+) -> Result<(), ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::ConstrType;
+
+    let constraints_of = |col: &'_ pg_query::protobuf::ColumnDef| {
+        col.constraints
+            .iter()
+            .filter_map(|c| match &c.node {
+                Some(Node::Constraint(c)) => Some(c.as_ref().clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let is_generated = |c: &pg_query::protobuf::Constraint| {
+        ConstrType::try_from(c.contype) == Ok(ConstrType::ConstrGenerated)
+    };
+    let table_name = bare_table_name(&relation.relname);
+    let mut table = GenerationTable {
+        schema_name: if table_name != relation.relname || relation.schemaname.is_empty() {
+            None
+        } else {
+            Some(relation.schemaname.as_str())
+        },
+        table_name,
+        columns: Vec::new(),
+        has_all_columns,
+        generated_columns: existing_generated_columns
+            .iter()
+            .map(String::as_str)
+            .collect(),
+    };
+    let mut table_foreign_keys = Vec::new();
+    for elt in table_elts {
+        match &elt.node {
+            Some(Node::ColumnDef(col)) => {
+                table
+                    .columns
+                    .push((col.colname.as_str(), col.type_name.as_ref()));
+                if constraints_of(col).iter().any(is_generated) {
+                    table.generated_columns.push(col.colname.as_str());
+                }
+            }
+            Some(Node::Constraint(c)) => {
+                if ConstrType::try_from(c.contype) == Ok(ConstrType::ConstrForeign) {
+                    table_foreign_keys.push(c.as_ref().clone());
+                }
+            }
+            _ => table.has_all_columns = false,
+        }
+    }
+    for elt in table_elts {
+        let Some(Node::ColumnDef(col)) = &elt.node else {
+            continue;
+        };
+        let constraints = constraints_of(col);
+        let mut generation_clauses = constraints.iter().filter(|c| is_generated(c));
+        let Some(generated) = generation_clauses.next() else {
+            continue;
+        };
+        if generation_clauses.next().is_some() {
+            return Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_SYNTAX_ERROR,
+                message: format!(
+                    "multiple generation clauses specified for column \"{}\" of table \"{}\"",
+                    col.colname, table.table_name
+                ),
+            });
+        }
+        if let Some(expr) = &generated.raw_expr {
+            validate_generation_expression(expr, &table)?;
+        }
+        for constraint in &constraints {
+            if ConstrType::try_from(constraint.contype) == Ok(ConstrType::ConstrForeign) {
+                reject_foreign_key_actions_on_generated_column(constraint)?;
+            }
+        }
+    }
+    for fk in &table_foreign_keys {
+        let columns = extract_key_columns(&fk.fk_attrs)?;
+        if columns
+            .iter()
+            .any(|c| table.generated_columns.contains(&c.as_str()))
+        {
+            reject_foreign_key_actions_on_generated_column(fk)?;
+        }
+    }
+    Ok(())
+}
+
+/// The table whose generation expressions are being checked.
+struct GenerationTable<'a> {
+    /// `None` when the schema is not known from the statement.
+    schema_name: Option<&'a str>,
+    table_name: &'a str,
+    columns: Vec<(&'a str, Option<&'a pg_query::protobuf::TypeName>)>,
+    has_all_columns: bool,
+    generated_columns: Vec<&'a str>,
+}
+
+impl GenerationTable<'_> {
+    fn column_type(&self, name: &str) -> ExprType {
+        self.columns
+            .iter()
+            .find(|(column, _)| *column == name)
+            .map_or(ExprType::Unknown, |(_, type_name)| {
+                ExprType::from_type_name(*type_name)
+            })
+    }
+}
+
+/// Check that a generation expression is immutable and reads only the non-generated columns
+/// of the row.
+fn validate_generation_expression(
+    expr: &pg_query::protobuf::Node,
+    table: &GenerationTable<'_>,
+) -> Result<(), ParseError> {
+    let error =
+        |sqlstate: &'static str, message: String| ParseError::Sqlstate { sqlstate, message };
+    let not_immutable = || {
+        error(
+            SQLSTATE_INVALID_OBJECT_DEFINITION,
+            "generation expression is not immutable".to_string(),
+        )
+    };
+    let Some(root) = expr.node.as_ref() else {
+        return Ok(());
+    };
+    for (node, ..) in root.nodes() {
+        match node {
+            NodeRef::SubLink(_) => {
+                return Err(error(
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    "cannot use subquery in column generation expression".to_string(),
+                ));
+            }
+            NodeRef::ParamRef(param) => {
+                return Err(error(
+                    SQLSTATE_UNDEFINED_PARAMETER,
+                    format!("there is no parameter ${}", param.number),
+                ));
+            }
+            NodeRef::FuncCall(call) => {
+                let name = last_string(&call.funcname)
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if call.over.is_some() {
+                    return Err(error(
+                        SQLSTATE_WINDOWING_ERROR,
+                        "window functions are not allowed in column generation expressions"
+                            .to_string(),
+                    ));
+                }
+                if call.agg_star
+                    || call.agg_distinct
+                    || call.agg_filter.is_some()
+                    || !call.agg_order.is_empty()
+                    || pg_func(&name).is_some_and(|f| f.aggregate)
+                {
+                    return Err(error(
+                        SQLSTATE_GROUPING_ERROR,
+                        "aggregate functions are not allowed in column generation expressions"
+                            .to_string(),
+                    ));
+                }
+                if pg_func(&name).is_some_and(|f| f.set_returning) {
+                    return Err(error(
+                        SQLSTATE_FEATURE_NOT_SUPPORTED,
+                        "set-returning functions are not allowed in column generation expressions"
+                            .to_string(),
+                    ));
+                }
+                if !pg_function_is_immutable(&name, &call.args, table) {
+                    return Err(not_immutable());
+                }
+            }
+            NodeRef::SqlvalueFunction(_) => return Err(not_immutable()),
+            NodeRef::AExpr(operation) => {
+                let operand_type = |operand: &Option<Box<pg_query::protobuf::Node>>| {
+                    operand
+                        .as_deref()
+                        .map_or(ExprType::Unknown, |operand| ExprType::of(operand, table))
+                };
+                let name = last_string(&operation.name).unwrap_or_default();
+                if !operator_is_immutable(
+                    &name,
+                    operand_type(&operation.lexpr),
+                    operand_type(&operation.rexpr),
+                ) {
+                    return Err(not_immutable());
+                }
+            }
+            NodeRef::TypeCast(cast) => {
+                let source = cast
+                    .arg
+                    .as_deref()
+                    .map_or(ExprType::Unknown, |arg| ExprType::of(arg, table));
+                let target = ExprType::from_type_name(cast.type_name.as_ref());
+                if !cast_is_immutable(source, target) {
+                    return Err(not_immutable());
+                }
+            }
+            NodeRef::ColumnRef(column) => {
+                let names: Vec<&str> = column
+                    .fields
+                    .iter()
+                    .filter_map(|f| match &f.node {
+                        Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let Some((&name, qualifiers)) = names.split_last() else {
+                    continue;
+                };
+                validate_column_qualifiers(qualifiers, table)?;
+                if SYSTEM_COLUMNS.contains(&name) {
+                    return Err(error(
+                        SQLSTATE_INVALID_COLUMN_REFERENCE,
+                        format!(
+                            "cannot use system column \"{name}\" in column generation expression"
+                        ),
+                    ));
+                }
+                if table.has_all_columns && !table.columns.iter().any(|(c, _)| *c == name) {
+                    return Err(error(
+                        SQLSTATE_UNDEFINED_COLUMN,
+                        format!("column \"{name}\" does not exist"),
+                    ));
+                }
+                if table.generated_columns.contains(&name) {
+                    return Err(error(
+                        SQLSTATE_INVALID_OBJECT_DEFINITION,
+                        format!(
+                            "cannot use generated column \"{name}\" in column generation expression"
+                        ),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Check the `table` or `schema.table` that qualifies a column of a generation expression.
+fn validate_column_qualifiers(
+    qualifiers: &[&str],
+    table: &GenerationTable<'_>,
+) -> Result<(), ParseError> {
+    let (schema, qualifying_table) = match qualifiers {
+        [] => return Ok(()),
+        [qualifying_table] => (None, *qualifying_table),
+        [schema, qualifying_table] => (Some(*schema), *qualifying_table),
+        _ => return Err(not_supported("a cross-database reference")),
+    };
+    if qualifying_table != table.table_name {
+        return Err(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_UNDEFINED_TABLE,
+            message: format!("missing FROM-clause entry for table \"{qualifying_table}\""),
+        });
+    }
+    if let (Some(schema), Some(table_schema)) = (schema, table.schema_name) {
+        if schema != table_schema {
+            return Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_UNDEFINED_TABLE,
+                message: format!(
+                    "invalid reference to FROM-clause entry for table \"{qualifying_table}\""
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// System columns, which a generation expression cannot use.
+const SYSTEM_COLUMNS: &[&str] = &["ctid", "xmin", "xmax", "cmin", "cmax"];
+
+fn pg_function_is_immutable(
+    name: &str,
+    args: &[pg_query::protobuf::Node],
+    table: &GenerationTable<'_>,
+) -> bool {
+    let datetime_arg_is_immutable = |position: usize| {
+        args.get(position).is_some_and(|arg| {
+            !matches!(
+                ExprType::of(arg, table),
+                ExprType::TimestampTz | ExprType::Literal | ExprType::Unknown
+            )
+        })
+    };
+    match name {
+        "extract" | "date_part" => datetime_arg_is_immutable(1),
+        "date_trunc" => args.len() == 3 || datetime_arg_is_immutable(1),
+        "age" => args.len() == 2,
+        "to_timestamp" => args.len() == 1,
+        _ => pg_func(name).map_or(true, |f| f.immutable),
+    }
+}
+
+/// Whether operator `name` on operands of types `left` and `right` is immutable.
+fn operator_is_immutable(name: &str, left: ExprType, right: ExprType) -> bool {
+    use ExprType::*;
+    match (name, left, right) {
+        ("||", Text, other)
+        | ("||", other, Text)
+        | ("||", Literal, other)
+        | ("||", other, Literal) => cast_is_immutable(other, Text),
+        ("+", TimestampTz, Interval | Literal) | ("+", Interval | Literal, TimestampTz) => false,
+        ("-", TimestampTz, Interval) => false,
+        _ => true,
+    }
+}
+
+/// Whether a cast from `source` to `target` is immutable.
+fn cast_is_immutable(source: ExprType, target: ExprType) -> bool {
+    use ExprType::*;
+    let is_datetime =
+        |t: ExprType| matches!(t, Date | Time | TimeTz | Timestamp | TimestampTz | Interval);
+    match (source, target) {
+        (Literal, _) => true,
+        (Text | Unknown, t) if is_datetime(t) => false,
+        (Date | Timestamp | TimestampTz | Interval, Text) => false,
+        (Date | Timestamp, TimestampTz) | (Time, TimeTz) => false,
+        (TimestampTz, Date | Time | TimeTz | Timestamp) => false,
+        _ => true,
+    }
+}
+
+/// The type of a value in a generation expression, as far as the volatility checks need it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExprType {
+    Literal,
+    Text,
+    Date,
+    Time,
+    TimeTz,
+    Timestamp,
+    TimestampTz,
+    Interval,
+    Other,
+    Unknown,
+}
+
+impl ExprType {
+    fn of(node: &pg_query::protobuf::Node, table: &GenerationTable<'_>) -> Self {
+        use pg_query::protobuf::node::Node;
+        match &node.node {
+            Some(Node::AConst(_)) => Self::Literal,
+            Some(Node::TypeCast(cast)) => Self::from_type_name(cast.type_name.as_ref()),
+            Some(Node::ColumnRef(column)) => {
+                match column.fields.last().and_then(|f| f.node.as_ref()) {
+                    Some(Node::String(name)) => table.column_type(&name.sval),
+                    _ => Self::Unknown,
+                }
+            }
+            _ => Self::Unknown,
+        }
+    }
+
+    fn from_type_name(type_name: Option<&pg_query::protobuf::TypeName>) -> Self {
+        let Some(name) = type_name.and_then(|t| last_string(&t.names)) else {
+            return Self::Unknown;
+        };
+        match name.to_lowercase().as_str() {
+            "text" | "varchar" | "bpchar" | "char" | "name" => Self::Text,
+            "date" => Self::Date,
+            "time" => Self::Time,
+            "timetz" => Self::TimeTz,
+            "timestamp" => Self::Timestamp,
+            "timestamptz" => Self::TimestampTz,
+            "interval" => Self::Interval,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Reject the foreign key actions that would write to a generated column.
+fn reject_foreign_key_actions_on_generated_column(
+    constraint: &pg_query::protobuf::Constraint,
+) -> Result<(), ParseError> {
+    let error = |event: &str| ParseError::Sqlstate {
+        sqlstate: SQLSTATE_SYNTAX_ERROR,
+        message: format!(
+            "invalid {event} action for foreign key constraint containing generated column"
+        ),
+    };
+    if matches!(constraint.fk_upd_action.as_str(), "c" | "n" | "d") {
+        return Err(error("ON UPDATE"));
+    }
+    if matches!(constraint.fk_del_action.as_str(), "n" | "d") {
+        return Err(error("ON DELETE"));
+    }
+    Ok(())
 }
 
 /// Extract a foreign key constraint from a PG Constraint node.
@@ -11413,11 +11891,22 @@ mod tests {
             "CREATE TABLE t (id int GENERATED BY DEFAULT AS IDENTITY)",
             "AS IDENTITY",
         );
-        assert_not_supported(
-            "CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED)",
-            "GENERATED ALWAYS AS",
-        );
+        assert_translates("CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED)");
         assert_translates("CREATE TABLE t (a int NULL)");
+    }
+
+    #[test]
+    fn test_stored_generated_column_emits_generated_constraint() {
+        let sql = "CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED)";
+        let parsed = crate::parse(sql).unwrap();
+        let result = PostgreSQLTranslator::new()
+            .translate_with_prereqs(&parsed)
+            .expect("translation must succeed");
+        let output = result.cmd.to_string();
+        assert!(
+            output.contains("AS (a * 2) STORED"),
+            "STORED generated column must keep its expression: {output}"
+        );
     }
 
     #[test]
