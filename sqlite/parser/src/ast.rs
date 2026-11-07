@@ -1720,6 +1720,8 @@ pub enum ColumnConstraint {
         expr: Box<Expr>,
         /// `STORED` / `VIRTUAL`
         typ: Option<GeneratedColumnType>,
+        /// Original SQL text in the source dialect (PG syntax). None for SQLite-originated columns.
+        dialect_expr_sql: Option<Box<str>>,
     },
 }
 

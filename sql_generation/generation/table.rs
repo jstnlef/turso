@@ -89,6 +89,7 @@ impl Table {
                     generated_always: false,
                     expr: Box::new(expr),
                     typ: Some(typ),
+                    dialect_expr_sql: None,
                 });
             }
         }

@@ -8,7 +8,10 @@ use turso_core::{
     dialect::POSTGRES_TABLE_SQL_PREFIX,
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
-    schema::{BTreeTable, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX},
+    schema::{
+        render_gencol_expr_sql_with_new_names, BTreeTable, GeneratedType, Schema, Sequence, Table,
+        UniqueSet, AUTOINCREMENT_SEQ_PREFIX,
+    },
     security::roles::{Role, RoleCatalog, RoleId},
     walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions,
     Result, Statement, Value, WalkControl,
@@ -320,6 +323,7 @@ impl Dialect for PostgresDialect {
     fn casts_nonzero_integer_to_true(&self) -> bool {
         true
     }
+
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
@@ -877,7 +881,8 @@ impl SnapshotRows for PgAttributeTable {
                 };
                 let attnum = (i + 1) as i64; // 1-based
                 let notnull = i64::from(col.notnull());
-                let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
+                let has_def = i64::from(col.default.is_some() || col.is_stored_generated());
+                let generated = if col.is_stored_generated() { "s" } else { "" };
 
                 rows.push(vec![
                     Value::from_i64(table_oid),   // attrelid
@@ -893,19 +898,19 @@ impl SnapshotRows for PgAttributeTable {
                     Value::build_text(storage),   // attstorage
                     Value::Text("i".into()),      // attalign (int)
                     Value::Text("".into()),
-                    Value::from_i64(notnull), // attnotnull
-                    Value::from_i64(has_def), // atthasdef
-                    Value::from_i64(0),       // atthasmissing
-                    Value::Text("".into()),   // attidentity
-                    Value::Text("".into()),   // attgenerated
-                    Value::from_i64(0),       // attisdropped
-                    Value::from_i64(1),       // attislocal
-                    Value::from_i64(0),       // attinhcount
-                    Value::from_i64(0),       // attcollation
-                    Value::Null,              // attacl
-                    Value::Null,              // attoptions
-                    Value::Null,              // attfdwoptions
-                    Value::Null,              // attmissingval
+                    Value::from_i64(notnull),      // attnotnull
+                    Value::from_i64(has_def),      // atthasdef
+                    Value::from_i64(0),            // atthasmissing
+                    Value::Text("".into()),        // attidentity
+                    Value::Text(generated.into()), // attgenerated
+                    Value::from_i64(0),            // attisdropped
+                    Value::from_i64(1),            // attislocal
+                    Value::from_i64(0),            // attinhcount
+                    Value::from_i64(0),            // attcollation
+                    Value::Null,                   // attacl
+                    Value::Null,                   // attoptions
+                    Value::Null,                   // attfdwoptions
+                    Value::Null,                   // attmissingval
                 ]);
             }
         }
@@ -2314,15 +2319,24 @@ impl SnapshotRows for PgAttrdefTable {
                 .unwrap_or(0);
 
             for (col_idx, col) in btree.columns().iter().enumerate() {
-                if let Some(default_expr) = &col.default {
-                    rows.push(vec![
-                        Value::from_i64(attrdef_oid),                 // oid
-                        Value::from_i64(table_oid),                   // adrelid
-                        Value::from_i64(col_idx as i64 + 1),          // adnum (1-based)
-                        Value::build_text(render_expr(default_expr)), // adbin
-                    ]);
-                    attrdef_oid += 1;
-                }
+                let adbin = match (&col.default, col.generated_type()) {
+                    (Some(default_expr), _) => render_expr(default_expr),
+                    (None, GeneratedType::Stored { dialect_expr_sql: Some(pg_sql), .. }) => {
+                        pg_sql.to_string()
+                    }
+                    (None, GeneratedType::Stored { expr, .. }) => {
+                        render_gencol_expr_sql_with_new_names(expr, btree.columns())
+                            .expect("stored generated column expression renders without error")
+                    }
+                    (None, _) => continue,
+                };
+                rows.push(vec![
+                    Value::from_i64(attrdef_oid),        // oid
+                    Value::from_i64(table_oid),          // adrelid
+                    Value::from_i64(col_idx as i64 + 1), // adnum (1-based)
+                    Value::build_text(adbin),            // adbin
+                ]);
+                attrdef_oid += 1;
             }
         }
         rows
@@ -5097,4 +5111,5 @@ mod tests {
             }
         }
     }
+
 }

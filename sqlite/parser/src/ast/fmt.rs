@@ -1982,6 +1982,7 @@ impl ToTokens for ColumnConstraint {
                 generated_always,
                 expr,
                 typ,
+                ..
             } => {
                 if *generated_always {
                     s.append(TK_GENERATED, None)?;

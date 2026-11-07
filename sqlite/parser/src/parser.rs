@@ -4229,6 +4229,7 @@ impl<'a> Parser<'a> {
             generated_always: tok.token_type == TK_GENERATED,
             expr,
             typ,
+            dialect_expr_sql: None,
         })
     }
 
@@ -11820,6 +11821,7 @@ mod tests {
                                     generated_always: true,
                                     expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                     typ: None,
+                                    dialect_expr_sql: None,
                                 },
                             },
                         ],
@@ -11844,6 +11846,7 @@ mod tests {
                                     generated_always: false,
                                     expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                     typ: None,
+                                    dialect_expr_sql: None,
                                 },
                             },
                         ],
@@ -11868,6 +11871,7 @@ mod tests {
                                     generated_always: false,
                                     expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                     typ: Some(GeneratedColumnType::Stored),
+                                    dialect_expr_sql: None,
                                 },
                             },
                         ],

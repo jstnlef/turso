@@ -7393,6 +7393,7 @@ pub fn create_table(
                 let mut default = None;
                 let mut generated: Option<Box<Expr>> = None;
                 let mut generated_stored = false;
+                let mut generated_dialect_sql: Option<Box<str>> = None;
                 let mut primary_key = false;
                 let mut notnull = false;
                 let mut explicit_notnull = false;
@@ -7410,12 +7411,13 @@ pub fn create_table(
                                 Some(&name),
                             ))?;
                         }
-                        ast::ColumnConstraint::Generated { expr, typ, .. } => {
+                        ast::ColumnConstraint::Generated { expr, typ, dialect_expr_sql, .. } => {
                             validate_generated_expr(expr)?;
                             generated = Some(expr.clone());
                             generated_stored = typ
                                 .as_ref()
                                 .is_some_and(|t| matches!(t, ast::GeneratedColumnType::Stored));
+                            generated_dialect_sql.clone_from(dialect_expr_sql);
                         }
                         ast::ColumnConstraint::PrimaryKey {
                             order: o,
@@ -7555,7 +7557,7 @@ pub fn create_table(
                     .with(ColDefFlags::ExplicitNotNull, explicit_notnull)
                     .with(ColDefFlags::Unique, unique);
 
-                let gen_type = generated.map(|expr| GeneratedType::new(expr, generated_stored));
+                let gen_type = generated.map(|expr| GeneratedType::new_with_dialect_sql(expr, generated_stored, generated_dialect_sql));
                 let mut col = Column::new(
                     Some(name),
                     ty_str,
@@ -8078,22 +8080,24 @@ pub enum GeneratedType {
     Virtual {
         expr: Box<Expr>,
         original_sql: String,
+        dialect_expr_sql: Option<Box<str>>,
     },
     /// Stored generated column: computed at write time and persisted on disk.
     Stored {
         expr: Box<Expr>,
         original_sql: String,
+        dialect_expr_sql: Option<Box<str>>,
     },
     NotGenerated,
 }
 
 impl GeneratedType {
-    fn new(expr: Box<Expr>, stored: bool) -> Self {
+    fn new_with_dialect_sql(expr: Box<Expr>, stored: bool, dialect_expr_sql: Option<Box<str>>) -> Self {
         let original_sql = expr.to_string();
         if stored {
-            GeneratedType::Stored { expr, original_sql }
+            GeneratedType::Stored { expr, original_sql, dialect_expr_sql }
         } else {
-            GeneratedType::Virtual { expr, original_sql }
+            GeneratedType::Virtual { expr, original_sql, dialect_expr_sql }
         }
     }
 }
@@ -8178,6 +8182,7 @@ impl Column {
         let mut default = None;
         let mut generated: Option<Box<Expr>> = None;
         let mut generated_stored = false;
+        let mut generated_dialect_sql: Option<Box<str>> = None;
         let mut coldef = ColDef {
             flags: ColDefFlags::from_def_flags(&flags),
             ..Default::default()
@@ -8217,11 +8222,12 @@ impl Column {
                     }
                     collation.replace(collation_seq);
                 }
-                ast::ColumnConstraint::Generated { expr, typ, .. } => {
+                ast::ColumnConstraint::Generated { expr, typ, dialect_expr_sql, .. } => {
                     generated = Some(expr.clone());
                     generated_stored = typ
                         .as_ref()
                         .is_some_and(|t| matches!(t, ast::GeneratedColumnType::Stored));
+                    generated_dialect_sql.clone_from(dialect_expr_sql);
                 }
                 _ => {}
             };
@@ -8262,7 +8268,7 @@ impl Column {
                 && primary_key_order != SortOrder::Desc,
         );
 
-        let gen_type = generated.map(|expr| GeneratedType::new(expr, generated_stored));
+        let gen_type = generated.map(|expr| GeneratedType::new_with_dialect_sql(expr, generated_stored, generated_dialect_sql));
         let mut col = Column::new(
             Some(name.to_string()),
             ty_str,

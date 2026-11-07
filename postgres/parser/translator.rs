@@ -901,12 +901,14 @@ impl PostgreSQLTranslator {
             .replace(Some(bare_table_name(tbl_name.name.as_str()).to_string()));
         let expr = self.translate_expr(raw_expr);
         self.generation_expression_table.replace(None);
+        let dialect_expr_sql = deparse_generation_expr(raw_expr).map(Into::into);
         Ok(ast::NamedColumnConstraint {
             name: None,
             constraint: ast::ColumnConstraint::Generated {
                 generated_always: true,
                 expr: Box::new(expr?),
                 typ: Some(ast::GeneratedColumnType::Stored),
+                dialect_expr_sql,
             },
         })
     }
@@ -8326,6 +8328,143 @@ fn deparse_default_expr(node: &pg_query::protobuf::Node) -> Option<String> {
         Some(Node::TypeCast(type_cast)) => {
             // Handle DEFAULT expressions with type casts like '0'::integer
             type_cast.arg.as_deref().and_then(deparse_default_expr)
+        }
+        _ => None,
+    }
+}
+
+fn pg_quote_identifier(name: &str) -> String {
+    if name.chars().any(|c| c.is_uppercase()) {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    } else {
+        name.to_string()
+    }
+}
+
+fn deparse_generation_expr(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::MinMaxOp;
+
+    match &node.node {
+        Some(Node::AConst(a_const)) => {
+            if let Some(ref val) = a_const.val {
+                use pg_query::protobuf::a_const::Val;
+                match val {
+                    Val::Ival(i) => Some(i.ival.to_string()),
+                    Val::Fval(f) => Some(f.fval.clone()),
+                    Val::Sval(s) => Some(format!("'{}'", s.sval.replace('\'', "''"))),
+                    Val::Bsval(s) => Some(format!("B'{}'", s.bsval.clone())),
+                    Val::Boolval(b) => Some(if b.boolval { "true" } else { "false" }.to_string()),
+                }
+            } else if a_const.isnull {
+                Some("NULL".to_string())
+            } else {
+                None
+            }
+        }
+        Some(Node::ColumnRef(col_ref)) => {
+            let parts: Vec<String> = col_ref
+                .fields
+                .iter()
+                .filter_map(|f| match &f.node {
+                    Some(Node::String(s)) => Some(pg_quote_identifier(&s.sval)),
+                    _ => None,
+                })
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("."))
+            }
+        }
+        Some(Node::MinMaxExpr(min_max)) => {
+            let func_name = match MinMaxOp::try_from(min_max.op) {
+                Ok(MinMaxOp::IsGreatest) => "greatest",
+                Ok(MinMaxOp::IsLeast) => "least",
+                _ => return None,
+            };
+            let args: Vec<String> = min_max
+                .args
+                .iter()
+                .filter_map(deparse_generation_expr)
+                .collect();
+            if args.len() != min_max.args.len() {
+                return None;
+            }
+            Some(format!("{func_name}({})", args.join(", ")))
+        }
+        Some(Node::FuncCall(func_call)) => {
+            let name: Vec<String> = func_call
+                .funcname
+                .iter()
+                .filter_map(|n| match &n.node {
+                    Some(Node::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect();
+            let func_name = name.join(".");
+            let func_name = func_name.strip_prefix("pg_catalog.").unwrap_or(&func_name);
+            let args: Vec<String> = func_call
+                .args
+                .iter()
+                .filter_map(deparse_generation_expr)
+                .collect();
+            if args.len() != func_call.args.len() {
+                return None;
+            }
+            Some(format!("{func_name}({})", args.join(", ")))
+        }
+        Some(Node::AExpr(a_expr)) => {
+            let op = a_expr.name.iter().rev().find_map(|n| match &n.node {
+                Some(Node::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })?;
+            match (a_expr.lexpr.as_deref(), a_expr.rexpr.as_deref()) {
+                (Some(l), Some(r)) => {
+                    let left = deparse_generation_expr(l)?;
+                    let right = deparse_generation_expr(r)?;
+                    Some(format!("{left} {op} {right}"))
+                }
+                (None, Some(r)) => {
+                    let right = deparse_generation_expr(r)?;
+                    Some(format!("{op} {right}"))
+                }
+                _ => None,
+            }
+        }
+        Some(Node::BoolExpr(bool_expr)) => {
+            use pg_query::protobuf::BoolExprType;
+            let parts: Vec<String> = bool_expr
+                .args
+                .iter()
+                .filter_map(deparse_generation_expr)
+                .collect();
+            if parts.len() != bool_expr.args.len() {
+                return None;
+            }
+            match bool_expr.boolop() {
+                BoolExprType::AndExpr => Some(format!("({})", parts.join(" AND "))),
+                BoolExprType::OrExpr => Some(format!("({})", parts.join(" OR "))),
+                BoolExprType::NotExpr => parts.first().map(|p| format!("(NOT {p})")),
+                _ => None,
+            }
+        }
+        Some(Node::TypeCast(type_cast)) => {
+            let arg = type_cast.arg.as_deref().and_then(deparse_generation_expr)?;
+            let type_name = type_cast
+                .type_name
+                .as_ref()
+                .and_then(|t| last_string(&t.names))?;
+            Some(format!("{arg}::{type_name}"))
+        }
+        Some(Node::NullTest(null_test)) => {
+            use pg_query::protobuf::NullTestType;
+            let arg = null_test.arg.as_deref().and_then(deparse_generation_expr)?;
+            match NullTestType::try_from(null_test.nulltesttype) {
+                Ok(NullTestType::IsNull) => Some(format!("{arg} IS NULL")),
+                Ok(NullTestType::IsNotNull) => Some(format!("{arg} IS NOT NULL")),
+                _ => None,
+            }
         }
         _ => None,
     }
