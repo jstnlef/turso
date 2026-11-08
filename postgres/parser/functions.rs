@@ -49,6 +49,11 @@ pub struct PgFunc {
     pub aggregate: bool,
 }
 
+/// Whether `name` is a PostgreSQL system column.
+pub fn is_system_column(name: &str) -> bool {
+    matches!(name, "ctid" | "xmin" | "xmax" | "cmin" | "cmax")
+}
+
 /// The built-in function called `name`, compared without regard to case.
 /// A name not in the registry is an immutable, non-set-returning function.
 pub fn pg_func(name: &str) -> Option<&'static PgFunc> {
@@ -341,5 +346,16 @@ mod tests {
     fn unknown_function_is_not_registered() {
         assert_eq!(pg_func("my_function"), None);
         assert_eq!(pg_func(""), None);
+    }
+
+    #[test]
+    fn system_columns_match_lowercase_only() {
+        assert!(is_system_column("ctid"));
+        assert!(is_system_column("xmin"));
+        assert!(is_system_column("xmax"));
+        assert!(is_system_column("cmin"));
+        assert!(is_system_column("cmax"));
+        assert!(!is_system_column("CTID"));
+        assert!(!is_system_column("Ctid"));
     }
 }

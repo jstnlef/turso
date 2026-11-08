@@ -3,7 +3,7 @@
 // This module translates pg_query's PostgreSQL AST into Turso's SQL AST
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
-use crate::functions::{pg_func, Immutability};
+use crate::functions::{is_system_column, pg_func, Immutability};
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_GROUPING_ERROR, SQLSTATE_INVALID_COLUMN_REFERENCE,
     SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_OBJECT_DEFINITION,
@@ -6962,7 +6962,7 @@ fn validate_generation_expression(
                     continue;
                 };
                 validate_column_qualifiers(qualifiers, table)?;
-                if SYSTEM_COLUMNS.contains(&name) {
+                if is_system_column(name) {
                     return Err(error(
                         SQLSTATE_INVALID_COLUMN_REFERENCE,
                         format!(
@@ -7021,8 +7021,6 @@ fn validate_column_qualifiers(
     Ok(())
 }
 
-/// System columns, which a generation expression cannot use.
-const SYSTEM_COLUMNS: &[&str] = &["ctid", "xmin", "xmax", "cmin", "cmax"];
 
 
 /// Whether operator `name` on operands of types `left` and `right` is immutable.
