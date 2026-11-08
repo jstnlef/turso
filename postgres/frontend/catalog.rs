@@ -323,7 +323,6 @@ impl Dialect for PostgresDialect {
     fn casts_nonzero_integer_to_true(&self) -> bool {
         true
     }
-
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
@@ -2321,9 +2320,13 @@ impl SnapshotRows for PgAttrdefTable {
             for (col_idx, col) in btree.columns().iter().enumerate() {
                 let adbin = match (&col.default, col.generated_type()) {
                     (Some(default_expr), _) => render_expr(default_expr),
-                    (None, GeneratedType::Stored { dialect_expr_sql: Some(pg_sql), .. }) => {
-                        pg_sql.to_string()
-                    }
+                    (
+                        None,
+                        GeneratedType::Stored {
+                            dialect_expr_sql: Some(pg_sql),
+                            ..
+                        },
+                    ) => pg_sql.to_string(),
                     (None, GeneratedType::Stored { expr, .. }) => {
                         render_gencol_expr_sql_with_new_names(expr, btree.columns())
                             .expect("stored generated column expression renders without error")
@@ -5111,5 +5114,4 @@ mod tests {
             }
         }
     }
-
 }

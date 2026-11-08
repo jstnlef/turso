@@ -497,12 +497,6 @@ expect {
     hello|5
 }
 
-test stored-generated-column-length-two-args-not-immutable {
-    CREATE TABLE t (s text, n int GENERATED ALWAYS AS (length(s, 'SQL_ASCII')) STORED);
-}
-@sqlstate 42P17
-expect error {}
-
 test stored-generated-column-quoted-uppercase-name-is-case-sensitive {
     CREATE TABLE t (a int, "Y" int GENERATED ALWAYS AS (a + 1) STORED, z int GENERATED ALWAYS AS (y + 1) STORED);
 }

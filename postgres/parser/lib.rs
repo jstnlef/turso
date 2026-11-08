@@ -229,9 +229,7 @@ pub fn alter_table_add_column_table(
 
 /// Returns the (schema, table) of a positional VALUES INSERT (no explicit column list).
 /// Returns None for any other statement, for INSERT with a column list, or for DEFAULT VALUES.
-pub fn positional_insert_table(
-    parse_result: &ParseResult,
-) -> Option<(Option<String>, String)> {
+pub fn positional_insert_table(parse_result: &ParseResult) -> Option<(Option<String>, String)> {
     use pg_query::NodeRef;
 
     let nodes = parse_result.protobuf.nodes();

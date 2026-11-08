@@ -7411,7 +7411,12 @@ pub fn create_table(
                                 Some(&name),
                             ))?;
                         }
-                        ast::ColumnConstraint::Generated { expr, typ, dialect_expr_sql, .. } => {
+                        ast::ColumnConstraint::Generated {
+                            expr,
+                            typ,
+                            dialect_expr_sql,
+                            ..
+                        } => {
                             validate_generated_expr(expr)?;
                             generated = Some(expr.clone());
                             generated_stored = typ
@@ -7557,7 +7562,13 @@ pub fn create_table(
                     .with(ColDefFlags::ExplicitNotNull, explicit_notnull)
                     .with(ColDefFlags::Unique, unique);
 
-                let gen_type = generated.map(|expr| GeneratedType::new_with_dialect_sql(expr, generated_stored, generated_dialect_sql));
+                let gen_type = generated.map(|expr| {
+                    GeneratedType::new_with_dialect_sql(
+                        expr,
+                        generated_stored,
+                        generated_dialect_sql,
+                    )
+                });
                 let mut col = Column::new(
                     Some(name),
                     ty_str,
@@ -8092,12 +8103,24 @@ pub enum GeneratedType {
 }
 
 impl GeneratedType {
-    fn new_with_dialect_sql(expr: Box<Expr>, stored: bool, dialect_expr_sql: Option<Box<str>>) -> Self {
+    fn new_with_dialect_sql(
+        expr: Box<Expr>,
+        stored: bool,
+        dialect_expr_sql: Option<Box<str>>,
+    ) -> Self {
         let original_sql = expr.to_string();
         if stored {
-            GeneratedType::Stored { expr, original_sql, dialect_expr_sql }
+            GeneratedType::Stored {
+                expr,
+                original_sql,
+                dialect_expr_sql,
+            }
         } else {
-            GeneratedType::Virtual { expr, original_sql, dialect_expr_sql }
+            GeneratedType::Virtual {
+                expr,
+                original_sql,
+                dialect_expr_sql,
+            }
         }
     }
 }
@@ -8222,7 +8245,12 @@ impl Column {
                     }
                     collation.replace(collation_seq);
                 }
-                ast::ColumnConstraint::Generated { expr, typ, dialect_expr_sql, .. } => {
+                ast::ColumnConstraint::Generated {
+                    expr,
+                    typ,
+                    dialect_expr_sql,
+                    ..
+                } => {
                     generated = Some(expr.clone());
                     generated_stored = typ
                         .as_ref()
@@ -8268,7 +8296,9 @@ impl Column {
                 && primary_key_order != SortOrder::Desc,
         );
 
-        let gen_type = generated.map(|expr| GeneratedType::new_with_dialect_sql(expr, generated_stored, generated_dialect_sql));
+        let gen_type = generated.map(|expr| {
+            GeneratedType::new_with_dialect_sql(expr, generated_stored, generated_dialect_sql)
+        });
         let mut col = Column::new(
             Some(name.to_string()),
             ty_str,

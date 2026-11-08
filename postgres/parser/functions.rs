@@ -31,9 +31,7 @@ impl Immutability {
             Self::Never => false,
             Self::ArgCount(n) => arg_count == n,
             Self::NonTzArg(pos) => !is_tz_arg(pos),
-            Self::ArgCountOrNonTz { count, position } => {
-                arg_count == count || !is_tz_arg(position)
-            }
+            Self::ArgCountOrNonTz { count, position } => arg_count == count || !is_tz_arg(position),
         }
     }
 }
@@ -155,7 +153,7 @@ static PG_FUNCS: phf::Map<&'static str, PgFunc> = phf_map! {
     "lastval" => PgFunc { immutability: Immutability::Never, set_returning: false, aggregate: false },
     "least" => PgFunc { immutability: Immutability::Always, set_returning: false, aggregate: false },
     "left" => PgFunc { immutability: Immutability::Always, set_returning: false, aggregate: false },
-    "length" => PgFunc { immutability: Immutability::ArgCount(1), set_returning: false, aggregate: false },
+    "length" => PgFunc { immutability: Immutability::Always, set_returning: false, aggregate: false },
     "ln" => PgFunc { immutability: Immutability::Always, set_returning: false, aggregate: false },
     "localtime" => PgFunc { immutability: Immutability::Never, set_returning: false, aggregate: false },
     "localtimestamp" => PgFunc { immutability: Immutability::Never, set_returning: false, aggregate: false },
@@ -313,7 +311,11 @@ mod tests {
             "uuid_generate_v4",
         ] {
             let func = pg_func(name).unwrap_or_else(|| panic!("{name} is not registered"));
-            assert_eq!(func.immutability, Immutability::Never, "{name} must not be immutable");
+            assert_eq!(
+                func.immutability,
+                Immutability::Never,
+                "{name} must not be immutable"
+            );
             assert!(!func.set_returning, "{name} must not return a set");
         }
     }

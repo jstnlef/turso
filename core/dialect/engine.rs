@@ -31,7 +31,7 @@ use crate::numeric::decimal::{
 };
 use crate::numeric::Numeric;
 use crate::pragma::PragmaVirtualTable;
-use crate::schema::{BTreeTable, Schema, Table};
+use crate::schema::{Schema, Table};
 use crate::stats::StatAccum;
 use crate::sync::Arc;
 use crate::types::AsValueRef;

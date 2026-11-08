@@ -6923,8 +6923,7 @@ fn validate_generation_expression(
                         )
                     })
                 };
-                let immutability = pg_func(&name)
-                    .map_or(Immutability::Always, |f| f.immutability);
+                let immutability = pg_func(&name).map_or(Immutability::Always, |f| f.immutability);
                 if !immutability.check(call.args.len(), is_tz_arg) {
                     return Err(not_immutable());
                 }
@@ -7026,8 +7025,6 @@ fn validate_column_qualifiers(
     }
     Ok(())
 }
-
-
 
 /// Whether operator `name` on operands of types `left` and `right` is immutable.
 fn operator_is_immutable(name: &str, left: ExprType, right: ExprType) -> bool {
