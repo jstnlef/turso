@@ -6873,6 +6873,12 @@ fn validate_generation_expression(
                     "cannot use subquery in column generation expression".to_string(),
                 ));
             }
+            NodeRef::CaseExpr(_) => {
+                return Err(error(
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    "CASE is not yet supported in column generation expressions".to_string(),
+                ));
+            }
             NodeRef::ParamRef(param) => {
                 return Err(error(
                     SQLSTATE_UNDEFINED_PARAMETER,
