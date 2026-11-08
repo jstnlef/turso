@@ -3,7 +3,7 @@
 // This module translates pg_query's PostgreSQL AST into Turso's SQL AST
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
-use crate::functions::pg_func;
+use crate::functions::{pg_func, Immutability};
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_GROUPING_ERROR, SQLSTATE_INVALID_COLUMN_REFERENCE,
     SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_OBJECT_DEFINITION,
@@ -6909,7 +6909,17 @@ fn validate_generation_expression(
                             .to_string(),
                     ));
                 }
-                if !pg_function_is_immutable(&name, &call.args, table) {
+                let is_tz_arg = |pos: usize| {
+                    call.args.get(pos).is_some_and(|arg| {
+                        matches!(
+                            ExprType::of(arg, table),
+                            ExprType::TimestampTz | ExprType::Literal | ExprType::Unknown
+                        )
+                    })
+                };
+                let immutability = pg_func(&name)
+                    .map_or(Immutability::Always, |f| f.immutability);
+                if !immutability.check(call.args.len(), is_tz_arg) {
                     return Err(not_immutable());
                 }
             }
@@ -7014,27 +7024,6 @@ fn validate_column_qualifiers(
 /// System columns, which a generation expression cannot use.
 const SYSTEM_COLUMNS: &[&str] = &["ctid", "xmin", "xmax", "cmin", "cmax"];
 
-fn pg_function_is_immutable(
-    name: &str,
-    args: &[pg_query::protobuf::Node],
-    table: &GenerationTable<'_>,
-) -> bool {
-    let datetime_arg_is_immutable = |position: usize| {
-        args.get(position).is_some_and(|arg| {
-            !matches!(
-                ExprType::of(arg, table),
-                ExprType::TimestampTz | ExprType::Literal | ExprType::Unknown
-            )
-        })
-    };
-    match name {
-        "extract" | "date_part" => datetime_arg_is_immutable(1),
-        "date_trunc" => args.len() == 3 || datetime_arg_is_immutable(1),
-        "age" => args.len() == 2,
-        "to_timestamp" => args.len() == 1,
-        _ => pg_func(name).map_or(true, |f| f.immutable),
-    }
-}
 
 /// Whether operator `name` on operands of types `left` and `right` is immutable.
 fn operator_is_immutable(name: &str, left: ExprType, right: ExprType) -> bool {
